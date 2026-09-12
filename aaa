@@ -1,0 +1,51 @@
+若能修改跑在 localhost:8787 的後端專案代碼，可以直接把「生成子進程」的寫法換成「原生產生 PTY」：
+
+若後端是 Node.js（最常見的 Web UI 後端）：
+安裝 node-pty：
+
+Bash
+npm install node-pty
+將原先呼叫 CLI 的 child_process.spawn() 改為：
+
+JavaScript
+const pty = require('node-pty');
+
+// 原生配置虛擬終端，直接向內部 CLI 下達必要參數
+const ptyProcess = pty.spawn('/mtktools/local/bin/claude', ['-oss', '--verbose', '--print', '--output-format=stream-json'], {
+  name: 'xterm-color',
+  cols: 80,
+  rows: 30,
+  cwd: process.cwd(),
+  env: process.env
+});
+
+// 即時監聽輸出並透過 SSE / WebSocket 推到前端
+ptyProcess.onData((data) => {
+  // 推送 data 給前端網頁
+});
+若後端是 Python（FastAPI / Flask）：
+不用安裝額外套件，直接使用標準函式庫 pty：
+
+Python
+import os
+import pty
+import subprocess
+
+# 自動建立 PTY master/slave 配對
+master, slave = pty.openpty()
+
+cmd = [
+    "/mtktools/local/bin/claude",
+    "-oss",
+    "--verbose",
+    "--print",
+    "--output-format=stream-json",
+]
+
+process = subprocess.Popen(
+    cmd, stdin=slave, stdout=slave, stderr=slave, close_fds=True
+)
+os.close(slave)  # 從端交給子進程，後端關閉自己的從端引用
+
+# 後端直接從 master 讀取串流資料
+output = os.read(master, 1024).decode()
