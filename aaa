@@ -1,64 +1,42 @@
-這是一份為 Claude AI 準備的 `plan.md`。我已根據您的要求，將所有 EDA（電子設計自動化）與演算法領域的專有名詞、核心概念替換為最精確的英文術語，並確保關鍵段落字數充足、剃除所有環境設定，且在開頭加入嚴格的防呆警語。
+# Role & Objective
+You are an expert EDA/SoC Methodology Engineer. Your task is to write a highly robust Python script to parse PrimeTime Static Timing Analysis (STA) reports. The script must extract features for ML-based bottleneck classification WITHOUT relying on DEF/physical coordinates.
 
----
+# Task Specification
+Write a Python class `STATimingParser` that takes a raw text block of a SINGLE timing path and returns a structured JSON/Dict containing three layers of analysis.
 
-# SoC Pre-CTS STA Topological Polymorphism Clustering & Bottleneck Mining Plan (plan.md)
+## Layer 1: Archetype Identification (型別識別)
+Identify the path type by scanning the `Startpoint`, `Endpoint`, and constraint keywords.
+- `REG2REG`: Start/End are flops/registers.
+- `IN2REG`: Startpoint contains "port". Data Arrival contains "input external delay".
+- `REG2OUT`: Endpoint contains "port". Data Required contains "output external delay".
+- `IN2OUT`: Both Startpoint and Endpoint contain "port".
+- `REG2CG`: Endpoint contains "clock gating" or "ICG".
+- `MAX_DELAY_ONLY`: Data Required section starts with "max_delay" (no capture clock edge).
 
-> **⚠️ CRITICAL WARNING FOR CLAUDE AI AGENT ⚠️**
-> **在執行本計畫的任何階段（包含 Architecture Design、Algorithm Derivation 或 Coding），若對演算法細節、Data Structure、EDA 物理工程背景或 Edge Cases 有任何疑問或理解模糊之處，【絕對禁止】自行腦補假設或套用常規預設寫法。你必須立即暫停實作，向 User 提出明確的澄清問題，直到完全與 User 確認並徹底明白真實工程意圖後，方可繼續執行。本任務屬於高度專業的 IC 設計自動化領域，容錯率極低。**
+## Layer 2: Clock & Budget Profiling (時鐘與預算計算)
+Dynamically calculate the effective budget and clock skew penalty ($R_{skew}$) based on the Archetype:
+- For `MAX_DELAY_ONLY`: $T_{budget}$ = max_delay value. $R_{skew} = 0$.
+- For `REG2REG` & `REG2CG`: 
+  * Extract $T_{launch\_edge}$ and $T_{capture\_edge}$. 
+  * $T_{period} = T_{capture\_edge} - T_{launch\_edge}$.
+  * $Skew = (T_{capture\_latency} + T_{cppr}) - T_{launch\_latency}$.
+  * $R_{skew} = -Skew / T_{period}$ (only if Skew < 0, else 0).
+- For `IN2REG` / `REG2OUT` / `IN2OUT`: 
+  * Extract the `external delay` value. 
+  * Define `External_Ratio = External_Delay / T_period`.
 
----
+## Layer 3: Data Path Micro-Profiling (Max% & N50)
+For the actual logic and net stages inside the Data Arrival Path (ignore clock network delays):
+1. Extract every stage's incremental delay ($d_i$), identify if it's dominated by 'cell' or 'net'.
+2. Calculate total data path delay $D_{total} = \sum d_i$.
+3. Sort all $d_i$ in descending order.
+4. Calculate **Max%** (Peak Delay Ratio): `max(d_i) / D_total`. Tag as `C` (cell) or `N` (net) dominant (e.g., `N45%`).
+5. Calculate **N50 Count**: The minimum number of sorted stages required to sum up to $\ge 0.50 \times D_{total}$.
 
-## 壹、 專案核心目的 (Project Purpose)
+## Output Format Requirements
+Return a flat dictionary with keys: `path_id`, `archetype`, `r_skew_pct`, `external_ratio_pct`, `max_pct_tag`, `n50_count`, `total_stages`.
 
-本系統的核心目的，是為了解決超大型 System-on-Chip (SoC) 在時鐘樹合成前（Pre-CTS）的 Static Timing Analysis (STA) 報告中，海量 Timing Violations 難以人工分類與責任派發（IP Owner Assignment）的業界痛點。在真實的 SoC Black-Box Netlist 中，面臨著兩個極端複雜的物理與拓撲現實：第一，**Hierarchy Depth Heterogeneity（階層深度極度異質）**，自研 CPU 的邏輯深度可能高達 8 層，而 Top-level IO 或綜合展平後的第三方 Hard IP 可能只有 2 層，導致傳統基於 Fixed Depth Index 的字串比對直接崩潰；第二，**Topological Polymorphism & Logic Cloning（拓撲多態性與邏輯複製）**，在相同的起訖 IP 與 Clock Domain 下，Data Path 可能流經完全不同的硬體通道（如 ALU vs FPU），且 Synthesis 工具會隨機插入 Buffers 或進行 Bus Splitting，造成嚴格字串比對無法收斂。
-
-為突破上述瓶頸，本系統嚴格排除依賴需要 GPU 重訓的 Deep Learning 模型，純粹採用 Deterministic Graph Theory 與 Sequence Mining 演算法。我們將透過 State Machine 解析巨量文本，引入 Selective Terminal Normalization 消除 EDA 工具雜訊。接著，運用 Global Namespace Trie 與 Dynamic Cut-plane，在單次 $O(N)$ 掃描中自適應解決 Hierarchy Depth Heterogeneity 問題。最後，引入生物資訊學的 Multiple Sequence Alignment (MSA) 與 Position Weight Matrix (PWM)，在模糊且破碎的實體連線中，提煉出抗干擾的 Consensus Backbone（共識物理病灶主幹）。最終目標是將十萬條亂碼般的違規路徑，精確降維成數十張帶有明確 Topology Signature 與實體修復指標（如 $R_{net}$、WNS）的 Actionable Tickets，完美對接後續的 Issue Dispatching。
-
----
-
-## 貳、 程式檔案目錄結構 (Directory Structure)
-
-遵循 Single Responsibility Principle (SRP)，系統解耦為以下結構：
-
-```text
-sta_clustering_engine/
-├── config.py             # 演算法 Hyperparameters (如 Support Ratio ρ) 與 Regex Patterns
-├── schema.py             # 強型別 Data Contracts (Pydantic / Dataclasses 定義 PathElement)
-├── report_parser.py      # 流式文字 State Machine，負責超大日誌的 O(1) Memory 解析
-├── normalizer.py         # Selective Terminal Normalization (處理 Bus Bits 與 Synthesis Artifacts)
-├── feature_builder.py    # 物理特徵解耦計算器 (計算 Net Delay Ratio R_net、跨界 Boundary 判定)
-├── trie_collapser.py     # Global Namespace Trie 與 Dynamic Cut-plane 演算法實作
-├── fuzzy_miner.py        # Jaccard 相似度 Graph Partitioning 與 MSA/PWM Consensus 探勘
-└── main.py               # 系統進入點與 Pipeline Orchestration
-
-```
-
----
-
-## 參、 關鍵步驟與核心演算法設計 (Phased Algorithms)
-
-### Phase 1: Stream Parsing & Selective Terminal Normalization
-
-本階段負責將非結構化的純文字 Timing Report 轉換為乾淨的拓撲序列。必須使用 State Machine 逐行讀取，絕對禁止使用 `readlines()` 導致 Out-of-Memory。在提取出每一條路徑的所有 Instances 後，必須呼叫 `normalizer.py` 執行 **Selective Terminal Normalization**。這是防禦 Trie 分支發生 Pseudo Fanout Explosion 的關鍵：演算法僅針對路徑的 Leaf Cell（最後一級實例）進行正則替換，將 Bus Bits Indices（如 `[31]`, `_bit0`）與 Synthesis Artifacts（如 `snps_cell_142`）強制替換為 Wildcard `*`。相反地，路徑中段的實體模組層級（如 `u_core0`, `u_channel_1`）必須被嚴格保留原始名稱，以維持晶片實體 Floorplan 的邊界資訊。此階段亦需並行計算物理指標，特別是 Net Delay Ratio ($R_{net}$)，以供後續判定瓶頸屬性是 Logic Depth 還是 Physical Routing Distance。
-
-### Phase 2: Dynamic Cut-plane & Global Namespace Trie
-
-為了解決 Hierarchy 深度從 2 層到 10 層不等的 Heterogeneity 痛點，必須實作自適應的樹狀演算法。首先，將所有正規化後的路徑以 `/` 拆解為 Tokens，全部插入同一棵 **Global Namespace Trie** 中，並在每個節點累加 Path Support（即經過該節點的違規路徑總數）。接著，執行 **Dynamic Cut-plane Evaluation**：從 Root 向下走訪，計算 Parent 與 Child 之間的 Support Retention Ratio ($\rho$)。若遇到實體 Leaf Node，或當 $\rho$ 小於配置的 Threshold（如 $0.5$），代表路徑在此發生了 Fanout Explosion（群體扇出爆炸），演算法必須立即在當前 Parent Node 觸發 Cut（截斷），忽略下游所有細碎分支。透過這種 Bottom-up 的統計方式，演算法能自動在深層模組深挖，並在淺層模組提前停止，為每條路徑生成無歧義的 Topology Signature，並利用 Hash Map 達到微秒級的 Clustering。
-
-### Phase 3: Fuzzy Clustering & Consensus PWM Mining
-
-即便經過 Phase 2 的初步分群，同一個 Cluster 內的路徑仍會受到 Logic Cloning 或 Buffer Detours 干擾，導致拓撲序列無法 100% 吻合。本階段必須實作 Fuzzy Clustering。首先，提取群內各路徑的 Instance Sets，計算 Jaccard Similarity 以建立 Topological Overlap Graph，透過 Connected Components 演算法將不相干的 Data Flows（如 ALU 串流與 FPU 串流）解耦為獨立的 Sub-forests。接著，針對每個 Sub-forest，引入動態規劃演算法執行 **Multiple Sequence Alignment (MSA)**。對齊後，建立 **Position Weight Matrix (PWM)**，統計每個拓撲深度位置上出現頻率最高的 Nodes。最終，演算法只提取出現機率超過 80% 的 Dominant Nodes 序列，過濾掉偶發的繞道單元，輸出一段乾淨、連續且具備工程指導意義的 **Consensus Backbone**，作為最終 Actionable Ticket 的核心特徵。
-
----
-
-## 肆、 完成後如何檢驗 (Verification & Acceptance Criteria)
-
-為確保本 EDA 演算法系統的工業級可靠性，實作完成後必須通過以下三個維度的嚴格檢驗，不得有任何妥協：
-
-1. **Heterogeneous Depth Edge-case Testing (極端異質深度邊界測試)**：
-必須構造虛擬的測試資料集，包含深度極淺的路徑（例如 $L=2$，如 `soc_top/pad_gpio_0`）以及深度極深的路徑（例如 $L=8$，包含深度嵌套的 Adder Tree）。檢驗 `trie_collapser.py` 是否能準確地將淺層路徑自動在 $L=2$ 處保留為 Leaf Node（不發生 Index Error），同時針對深層路徑，當手動注入一個擁有 100 個 Fanout 的節點時，系統必須精準在該 Fanout Explosion 點觸發 Dynamic Cut-plane。截斷輸出的 Topology Signature 必須具備唯一確定性，且所有同源路徑必須被 Hash 到同一個 Cluster 中。
-2. **Fuzzy Tolerance & Noise Convergence Testing (模糊容錯與雜訊收斂測試)**：
-測試 `fuzzy_miner.py` 對物理佈局雜訊的 Robustness。需構造兩組高度相似的 32-bit Data Paths：其中一組 16-bit 完美對齊，另一組 16-bit 中間被隨機插入 1~2 顆不同命名的 Synthesis Buffers。檢驗系統是否能透過 MSA 與 PWM，成功將這 32 條路徑判定為同一個病灶主幹，並在最終輸出的 Consensus Backbone 中自動剔除（或標記為 Optional）那些低頻出現的 Buffers，提煉出最純粹的 Logic Cone 交集。同時，檢驗 $R_{net}$ 的計算結果，若總 Delay 的 70% 來自 Net Delay，系統必須成功將該 Cluster 標記為 Long Routing Flight。
-3. **Algorithmic Scalability & O(1) Memory Check (大尺度計算複雜度與記憶體監控)**：
-由於真實 SoC 的 Timing Report 動輒百萬行，系統的 Data Pipeline 設計必須被驗證。需生成一份包含至少 100,000 條違規路徑的假報表進行 Stress Testing。檢驗 `report_parser.py` 是否確實執行 Generator 流式讀取，在整個解析與 Trie Construction 過程中，Peak Memory 增長必須維持在極低水位（符合 $O(N)$ Space Complexity），絕對不允許出現 Memory Bloat。同時，整體分群執行時間應控制在數秒至數十秒量級，證明 Hash Aggregation 與單次 Trie Traversal 達到了頂會論文宣稱的極速處理效能。
+## Coding Style
+- Use modular Regex compilations for performance.
+- Handle corner cases (e.g., CPPR/CRPR might be missing).
+- Provide a clear `__main__` block with dummy text to test the regex.
