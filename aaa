@@ -1,42 +1,83 @@
-# Role & Objective
-You are an expert EDA/SoC Methodology Engineer. Your task is to write a highly robust Python script to parse PrimeTime Static Timing Analysis (STA) reports. The script must extract features for ML-based bottleneck classification WITHOUT relying on DEF/physical coordinates.
+# PrimeTime STA Timing Report 判讀規範與解析腳本修正指引
 
-# Task Specification
-Write a Python class `STATimingParser` that takes a raw text block of a SINGLE timing path and returns a structured JSON/Dict containing three layers of analysis.
+本文件包含兩大部分：
+1. **STA Timing Report 正確解讀與特徵判讀指南**：說明工程師與程式應如何逐行解讀報表欄位、區分延遲屬性與劃分階層責任。
+2. **糾錯與重新產生腳本的 Master Prompt**：針對先前解析邏輯出現的屬性顛倒、數值截斷與階層誤判，提供直接發布給 AI 的修正規格書。
 
-## Layer 1: Archetype Identification (型別識別)
-Identify the path type by scanning the `Startpoint`, `Endpoint`, and constraint keywords.
-- `REG2REG`: Start/End are flops/registers.
-- `IN2REG`: Startpoint contains "port". Data Arrival contains "input external delay".
-- `REG2OUT`: Endpoint contains "port". Data Required contains "output external delay".
-- `IN2OUT`: Both Startpoint and Endpoint contain "port".
-- `REG2CG`: Endpoint contains "clock gating" or "ICG".
-- `MAX_DELAY_ONLY`: Data Required section starts with "max_delay" (no capture clock edge).
+---
 
-## Layer 2: Clock & Budget Profiling (時鐘與預算計算)
-Dynamically calculate the effective budget and clock skew penalty ($R_{skew}$) based on the Archetype:
-- For `MAX_DELAY_ONLY`: $T_{budget}$ = max_delay value. $R_{skew} = 0$.
-- For `REG2REG` & `REG2CG`: 
-  * Extract $T_{launch\_edge}$ and $T_{capture\_edge}$. 
-  * $T_{period} = T_{capture\_edge} - T_{launch\_edge}$.
-  * $Skew = (T_{capture\_latency} + T_{cppr}) - T_{launch\_latency}$.
-  * $R_{skew} = -Skew / T_{period}$ (only if Skew < 0, else 0).
-- For `IN2REG` / `REG2OUT` / `IN2OUT`: 
-  * Extract the `external delay` value. 
-  * Define `External_Ratio = External_Delay / T_period`.
+## 第一部分：如何正確解讀 PrimeTime STA Timing Report
 
-## Layer 3: Data Path Micro-Profiling (Max% & N50)
-For the actual logic and net stages inside the Data Arrival Path (ignore clock network delays):
-1. Extract every stage's incremental delay ($d_i$), identify if it's dominated by 'cell' or 'net'.
-2. Calculate total data path delay $D_{total} = \sum d_i$.
-3. Sort all $d_i$ in descending order.
-4. Calculate **Max%** (Peak Delay Ratio): `max(d_i) / D_total`. Tag as `C` (cell) or `N` (net) dominant (e.g., `N45%`).
-5. Calculate **N50 Count**: The minimum number of sorted stages required to sum up to $\ge 0.50 \times D_{total}$.
+在靜態時序分析（STA）中，單純抓取數值容易產生嚴重誤判。判讀標準 PrimeTime 報表時，必須依循以下物理因果關係與結構邏輯：
 
-## Output Format Requirements
-Return a flat dictionary with keys: `path_id`, `archetype`, `r_skew_pct`, `external_ratio_pct`, `max_pct_tag`, `n50_count`, `total_stages`.
+### 1. Cell Delay 與 Net Delay 的嚴格識別準則
 
-## Coding Style
-- Use modular Regex compilations for performance.
-- Handle corner cases (e.g., CPPR/CRPR might be missing).
-- Provide a clear `__main__` block with dummy text to test the regex.
+PrimeTime 的時序路徑展開是以「交替推進」的方式呈現：
+$$\text{Cell Input Pin} \xrightarrow{\text{Cell Delay}} \text{Cell Output Pin} \xrightarrow{\text{Net Delay}} \text{Next Cell Input Pin}$$
+
+* **Cell Delay（邏輯閘切換延遲）：**
+  * **特徵**：該行末端會以括號明確標註 Library Cell Type（例如 `(POUIN1P4T55N14SH16DCPDTRLL)` 或 `(CKLSLZ...)`）[cite: 1]。
+  * **意義**：此時序級的增量延遲（Incr）是訊號在元件內部由 Input Pin 傳遞至 Output Pin 的時間[cite: 1]。
+* **Net Delay（走線延遲）：**
+  * **特徵**：該行通常為下一級的輸入 Pin，末端不會出現 Library Cell 名稱，或者會標示為 `(net)`[cite: 1]。
+* **「推力崩潰 / 扇出過載」的綜合歸因：**
+  * 若某行出現極大的延遲（如數千奈秒），且伴隨 `Cap`（電容）極大（例如接近 4 pF）與 `Trans`（Slew）急劇惡化（例如飆升至 9 ns）[cite: 1]，此時延遲本質上是由於**驅動元件（Driver Cell）無法推動巨大負載**所致[cite: 1]。
+  * 在微觀標籤（Micro Profile Tag, `mpt`）判定時，應將此類由元件推力耗盡造成的瓶頸歸類為 **Cell 瓶頸（`C`）**[cite: 2]，而非單純的走線問題（`N`）[cite: 2]。
+
+---
+
+### 2. 階層模組（Region）的正確劃分
+
+切分責任區間不能只做子字串模糊比對（如看到 `_top_` 就判為頂層）：
+* **Subsystem / Partition Wrapper**：
+  * 應以階層分隔符號（`/`）拆解路徑，提取第一層或最外層的包裹模組（Wrapper）名稱[cite: 1]。
+  * 例如：`u_tse_top_par_wrap/...` 屬於 **TSE 測試子系統**，`u_vlp_ext_par_wrap/...` 屬於 **VLP 子系統**[cite: 1]。
+* **Top-Level 判定**：
+  * 只有當 Pin 直接連接在晶片最頂層（Chip Top），且未歸屬於任何已實例化的 Subsystem Wrapper 時，才能標記為 `"top"`。
+  * 將 `u_tse_top_par_wrap` 誤判為 `"top"` 會導致系統整合團隊誤將 IP 出口推力缺陷歸咎給頂層繞線[cite: 1, 2]。
+
+---
+
+### 3. 完整路徑的資料加總終點
+
+* 資料路徑（Data Arrival Path）的累計必須嚴格從 `Startpoint` 後的第一個時序點開始，**一路持續累加至出現 `data arrival time` 數值為止**[cite: 1]。
+* 任何中途發生的階層名稱換行或總線（Bus）信號處理，都不得提前截斷加總，否則會導致總延遲與報表原生抵達時間出現差額[cite: 1, 2]。
+
+---
+
+## 第二部分：修正腳本用的 Master Prompt
+
+```markdown
+# Role & Task
+You are an expert EDA/SoC Static Timing Analysis (STA) Automation Engineer.
+Your previous implementation of the PrimeTime report parser had critical bugs in the JSONL output. 
+Rewrite the parsing script strictly following the root cause analysis and specifications below.
+
+# Bug Analysis & Corrections Required
+
+1. FIX: Cell vs. Net Delay Misclassification (CRITICAL)
+   - Previous Issue: You classified the 4310ns delay as Net (`mpt: "N99"`, `pt: "n"`). This is functionally incorrect.
+   - Ground Truth: The massive delay and slew breakdown (Trans = 9.1ns) were caused by an unbuffered pad/buffer cell attempting to drive a 3.9pF load.
+   - Correction Specification:
+     * Identify a Cell stage by inspecting whether the line ends with a Library Cell type in parentheses (e.g., `(POUIN1P...)`).
+     * If the bottleneck is driven by a weak cell under high capacitance/slew degradation, classify the peak bottleneck type (`pt`) as 'c' and the peak tag (`mpt`) as `C` (e.g., `C98` or `C99`).
+
+2. FIX: Data Arrival Path Delay Truncation
+   - Previous Issue: The summed segment delay was `4369.81ns`, whereas the report clearly states `data arrival time = 4390.367676ns` (truncated by ~20.55ns).
+   - Correction Specification:
+     * Continue stage extraction all the way down to the exact row labeled `data arrival time`.
+     * Ensure the sum of all segment delays matches `data arrival time` within floating-point tolerance.
+
+3. FIX: Hierarchical Region Tagging
+   - Previous Issue: You marked the first segment as `region: "top"`.
+   - Ground Truth: The path begins at `u_tse_top_par_wrap/...`, which is an instantiated subsystem block, not chip-level top routing.
+   - Correction Specification:
+     * Split instance paths using the hierarchy delimiter `/`.
+     * Extract the outer subsystem wrapper name (e.g., `u_tse_top_par_wrap`, `u_vlp_ext_par_wrap`, `u_vadsys_ext_par_wrap`).
+     * Only assign `region: "top"` if the pin does not belong to any partition wrapper.
+
+# Technical Requirements
+- Language: Python 3 (use `re` and standard libraries).
+- Output Schema: Maintain the original JSONL schema:
+  `{"le": [...], "at": "...", "lc": "...", "cc": "...", "sr": ..., "ex": ..., "sk": ..., "mpt": "...", "n50": ..., "ns": ..., "seg": [...]}`
+- Provide clean, robust regular expressions to extract columns: Point, Cap, Trans, Incr, Path, and Library Cell Type.
