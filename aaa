@@ -1,46 +1,37 @@
 # Role & Objective
-You are an expert EDA/SoC STA Automation Engineer. 
-A critical numerical truncation bug exists in the current PrimeTime STA JSONL parser: the accumulated data path delay is missing approximately 66ns compared to the ground truth `data arrival time`.
+You are an expert EDA/SoC Methodology Engineer. Your goal is to write a high-throughput, robust Python parser for PrimeTime Static Timing Analysis (STA) reports. 
 
-# Bug Analysis & Ground Truth
+The parser converts raw text reports into a streamlined JSONL format (`paths.jsonl`). The primary objective is **Macro/Micro Delay Distribution Triage and Unified Budget Profiling**, designed for downstream clustering and bottleneck classification without relying on physical coordinate data.
 
-1. MISSING DELAY (TRUNCATION BUG):
-   - Current JSON output sum of all segments: ~4324.37ns
-   - STA Report ground truth (`data arrival time`): 4390.367676ns
-   - Discrepancy: Exactly ~66.00ns missing in the destination block.
-   - Root Cause:
-     In the report, the signal traverses into the destination subsystem wrapper:
-     `u_vadsys_ext_par_wrap/u_vadsys_top_par_wrap/...`
-     The segment for `u_vadsys` was incorrectly emitted with `delay: 0.0`. 
-     The stage delays between crossing the boundary and reaching `.../reg_dcm_resource_mask_reg_15_/D` were skipped or flushed prematurely during region boundary transitions.
+---
 
-2. FRAGMENTATION & PIN NAME FIXES:
-   - Clean up `pn` (Peak Instance Name): Strip the trailing pin name (the part after the last `/`), keeping only the instance name for downstream signature clustering.
-   - Consolidate continuous sub-stages: Do not break contiguous routing into micro-top segments unless it genuinely leaves the subsystem wrapper back to top-level pins.
-   - The total sum of `delay` across all elements in `seg` MUST match `data arrival time` within 0.001ns tolerance.
+# Core Philosophy: The Unified Budget Concept
+Regardless of path topology, Static Timing Analysis (STA) is fundamentally an accounting of time budget versus consumed delay:
+$$\text{Slack} = \text{Effective Budget} - \text{Data Arrival Delay}$$
 
-# Schema & Requirements
-Maintain the defined JSONL schema while removing the redundant `mpt` field:
-- Schema fields:
-  * `le`: [start_line, end_line]
-  * `at`: Archetype string (e.g., "MAX_DELAY_ONLY")
-  * `lc`: Launch clock or "NA"
-  * `cc`: Capture clock
-  * `sr`: Skew-to-period ratio (float)
-  * `ex`: External delay ratio or null
-  * `sk`: Slack value (float)
-  * `n50`: Global Top-50% stage count (integer)
-  * `ns`: Total stages in data path (integer)
-  * `seg`: List of tuples: `[region, delay, pt, pd, pn, th]`
-    - `region`: Subsystem wrapper name or 'top'
-    - `delay`: Summed Incr over this contiguous block
-    - `pt`: 'c' or 'n'
-    - `pd`: Peak single-stage delay within this segment
-    - `pn`: Instance name of the worst stage (without pin name)
-    - `th`: Minimum stages covering 50% of this segment's delay
+Different path archetypes simply define how the budget is formulated and how much of that ideal budget is eroded before signals even traverse the internal data logic:
+1. **Clock Skew Loss (`REG2REG`, `REG2CG`)**: Real clock tree mismatch (negative skew) robs the timing budget.
+2. **External Contract Loss (`IN2REG`, `REG2OUT`, `IN2OUT`)**: Virtual board-level/external delays consume the budget before/after chip boundary.
+3. **Constant Override (`MAX_DELAY_ONLY`)**: The budget is a fixed constant ($T_{\text{max\_delay}}$) with zero physical clock skew.
 
-# Instruction
-Rewrite the Python parsing logic (specifically the line iteration and region-grouping state machine) to guarantee that:
-1. Every row with an `Incr` value from `Startpoint` down to `data arrival time` is accounted for without omission.
-2. The final destination subsystem accumulates the remaining ~66ns properly.
-3. Return the fully corrected, functional Python code.
+Therefore, do not over-complicate the schema with sparse ratio fields. Unify this loss into a single **Constraint Penalty Ratio (`cr`)**, interpreted conditionally by the **Archetype (`at`)**.
+
+---
+
+# JSONL Output Schema
+Emit one JSON object per timing path line (matching the updated compact schema):
+
+```json
+{
+  "le": [start_line, end_line],
+  "at": "<ARCHETYPE>",
+  "lc": "<LAUNCH_CLOCK_OR_NA>",
+  "cc": "<CAPTURE_CLOCK_OR_NA>",
+  "cr": <CONSTRAINT_PENALTY_RATIO_FLOAT_OR_NULL>,
+  "sk": <SLACK_FLOAT>,
+  "n50": <GLOBAL_N50_INT>,
+  "ns": <TOTAL_DATA_STAGES_INT>,
+  "seg": [
+    ["<REGION>", <SEG_DELAY>, "<PT>", <PD>, "<PN>", <TH>]
+  ]
+}
