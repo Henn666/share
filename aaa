@@ -1,116 +1,95 @@
-要正確解析 PrimeTime (PT) 這種帶有空白欄位且欄位沒有完美對齊的 .rpt 報告，最穩健的做法是使用「標題行 (Header) 的字元索引位置」來動態切割固定寬度 (Fixed-width) 的資料，而不是使用單純的空白字元分割 (split())。
-
-因為報告中的數值通常是靠右對齊標題，我們可以用 Python 讀取標題行，找出每個欄位名稱的 start 與 end 位置，並計算出欄位與欄位之間的「中位數」作為切割邊界。這樣就能完美抓取數值並辨識出真正的空白欄位。
-
-以下是為這類 PrimeTime 報告撰寫的動態解析 Python 腳本：
+以下是針對此邏輯重新設計的可靠 Python 腳本：
 
 Python
 import re
 
-def parse_pt_rpt(file_path):
+def is_float(val):
+    try:
+        float(val)
+        return True
+    except ValueError:
+        return False
+
+def parse_pt_rpt_robust(file_path):
     parsed_data = []
     
+    # 建立正則表達式：捕捉行首的字串，若後方有帶括號的 (cell) 則一併捕捉
+    # 範例匹配："U_CORE/U_ALU/out", 或 "U_CORE/U_ALU/out (INVX4)"
+    point_re = re.compile(r'^(\S+(?:\s+\([^)]+\))?)')
+    
     with open(file_path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-        
-    header_line = None
-    data_start_idx = 0
-    
-    # 1. 尋找標題行 (Header)
-    for i, line in enumerate(lines):
-        # 利用報告中特有的欄位名稱定位標題行
-        if "Cap" in line and "DTrans" in line and "Trans" in line:
-            header_line = line
-            # 通常下一行是 '---' 分隔線，再下一行才是資料
-            data_start_idx = i + 2  
-            break
+        for line in f:
+            original_line = line.rstrip('\n')
+            work_line = original_line.strip()
             
-    if not header_line:
-        print("找不到標題行！")
-        return []
-        
-    # 2. 動態計算欄位邊界 (Boundaries)
-    # 找出標題行中每個單字的起始與結束字元索引
-    headers = list(re.finditer(r'\S+', header_line))
-    boundaries = []
-    
-    # PT 報告最左側通常有路徑/節點名稱 (Point/Pin)，其標題往往是隱含的或不在同一行
-    # 我們將第一個明確標題 (Cap) 前面的所有空間，歸類為 "Point" 欄位
-    first_header_start = headers[0].start()
-    boundaries.append({
-        "name": "Point",
-        "start": 0,
-        "end": first_header_start - 2 # 留一點緩衝
-    })
-    
-    # 計算其餘標題的動態切割邊界
-    for i in range(len(headers)):
-        header_name = headers[i].group()
-        
-        # 該欄位的起始位置：前一個標題與目前標題之間的空白中點
-        if i == 0:
-            start_pos = first_header_start - 2
-        else:
-            prev_end = headers[i-1].end()
-            curr_start = headers[i].start()
-            start_pos = (prev_end + curr_start) // 2
-            
-        # 該欄位的結束位置：目前標題與下一個標題之間的空白中點
-        if i == len(headers) - 1:
-            end_pos = 9999  # 最後一個欄位 (Voltage) 直接抓到行尾
-        else:
-            curr_end = headers[i].end()
-            next_start = headers[i+1].start()
-            end_pos = (curr_end + next_start) // 2
-            
-        boundaries.append({
-            "name": header_name,
-            "start": start_pos,
-            "end": end_pos
-        })
-        
-    # 3. 讀取並切割每一行資料
-    for line in lines[data_start_idx:]:
-        # 遇到分隔線或空行代表區塊結束，或是無效行[cite: 1]
-        if line.strip().startswith('---') or not line.strip():
-            continue 
-            
-        row_data = {}
-        is_empty_row = True
-        
-        for bound in boundaries:
-            # 根據計算出的邊界絕對位置切割字串，並去除前後空白
-            cell_str = line[bound["start"]:bound["end"]].strip()
-            
-            # 若 cell_str 為空，代表該欄位確實是空白的
-            if cell_str:
-                row_data[bound["name"]] = cell_str
-                is_empty_row = False
-            else:
-                row_data[bound["name"]] = None  # 標記為空白欄位
+            # 略過分隔線或空行
+            if not work_line or work_line.startswith('---') or work_line.startswith('Cap'):
+                continue
                 
-        # 避免將純空白行加入資料中
-        if not is_empty_row:
+            row_data = {
+                "Point": None,
+                "Incr": None,
+                "Marker": None, # 例如 '*', 'H' 等 violation 標記
+                "Path_Value": None,
+                "Dir": None,
+                "Voltage": None,
+                "Middle_Raw": [] # 存放中間不穩定的欄位
+            }
+            
+            # 1. 處理左段 (Point row)
+            match = point_re.match(work_line)
+            if match:
+                row_data["Point"] = match.group(1)
+                # 將左段名稱從字串中移除，剩下的就是純數值與標記的區域
+                work_line = work_line[len(row_data["Point"]):].strip()
+            
+            # 2. 將剩下的字串依空白分割成 Token 陣列
+            tokens = work_line.split()
+            if not tokens:
+                if row_data["Point"]:
+                    parsed_data.append(row_data)
+                continue
+
+            # 3. 處理右段 (從尾部倒序取值)
+            # 判斷是否為標準的 Timing Path 行 (倒數第二個 token 應該是 r 或 f)
+            if len(tokens) >= 3 and tokens[-2] in ['r', 'f']:
+                try:
+                    row_data["Voltage"] = float(tokens[-1])
+                    row_data["Dir"] = tokens[-2]
+                    row_data["Path_Value"] = float(tokens[-3])
+                    
+                    # 判斷倒數第 4 個位置是 marker 還是 Incr
+                    if is_float(tokens[-4]):
+                        # 如果是數字，代表沒有 marker，此值即為 Incr
+                        row_data["Incr"] = float(tokens[-4])
+                        middle_end_idx = -4
+                    else:
+                        # 如果不是數字，代表是 marker (如 '*' 或 'H')
+                        row_data["Marker"] = tokens[-4]
+                        row_data["Incr"] = float(tokens[-5])
+                        middle_end_idx = -5
+                        
+                    # 4. 中間剩餘的 tokens 全部原樣保留，不強制對齊
+                    row_data["Middle_Raw"] = tokens[:middle_end_idx]
+                    
+                except (ValueError, IndexError):
+                    # 若轉型失敗，退回 raw 模式
+                    row_data["Middle_Raw"] = tokens
+            else:
+                # 處理非標準行 (例如只有 Incr 或是 summary 行)
+                row_data["Middle_Raw"] = tokens
+                
             parsed_data.append(row_data)
-        
+            
     return parsed_data
 
-# 執行與測試
-# data = parse_pt_rpt("your_report_file.rpt")
-# for row in data[:5]:
-#     print(row)
-腳本運作原理解析
-動態邊界定位：程式利用 re.finditer 找到 Cap、DTrans、Trans 等標題的位置[cite: 1]。接著計算標題與標題之間的「中位數」作為字串切片的邊界。因為 PrimeTime 的數值通常對齊標題的右側，這種作法能確保數值不會被切斷或歸錯欄位。
+# 使用範例：
+# results = parse_pt_rpt_robust("your_report.rpt")
+# for r in results:
+#     print(r)
+此方法的可靠性優勢
+完全無視欄位位移：左側 Point 無論多長（例如 200 字元）都不會干擾數值讀取，因為它是用正則從頭擷取後直接剔除，剩下的字串只靠空格（空格數量不影響 split()）切分 Token。
 
-空白欄位辨識：在固定的字串區段內（例如 line[45:58]），如果使用 .strip() 清除空白後得到空字串 ""，程式就會將其判定為 None，成功解決連續空白導致 split() 錯位的問題。
+避開 Marker 陷阱：PT 報告中的 *（Violated）或 H（High）是「有時出現、有時不出現」的。這支程式不會寫死 Index，而是檢查 t[-4] 是否能轉為 float。如果是字串就是 Marker，真正的 Incr 則往左推一格找 t[-5]。
 
-處理後綴字元與標記：報告中的數值後方常帶有 * (Violated)、r (Rising)、f (Falling)、H 等狀態標記[cite: 1]。此腳本會將它們連同數值一起讀取（例如 "0.082600 f" 或 "0.017700 *"）[cite: 1]。
-
-分離數值與標記 (進階處理)：如果在後續的資料分析中需要純數值，可以在讀取後對 cell_str 進行二次正則表達式過濾：
-
-Python
-# 將 "0.082600 f" 拆分為數值與標記
-match = re.match(r"([-+]?\d*\.?\d+)\s*(.*)", cell_str)
-if match:
-    value = float(match.group(1))
-    flag = match.group(2) # 得到 'f', 'r', '*' 或空字串
+不猜中間邊界（Fail-Safe）：中間的 Cap、DTrans、Trans、Derate 數量與位置變動太大，腳本直接將它們打包進 Middle_Raw 這個 List 中。未來如果有需要抓取特定值（例如確定左數第一個數字一定是 Cap），直接從 Middle_Raw[0] 取用即可，不會導致 parser 崩潰。
