@@ -1,119 +1,116 @@
-你可以直接複製以下這整段（包含 Markdown 標記）並發送給負責寫 Code 的 AI：
+要正確解析 PrimeTime (PT) 這種帶有空白欄位且欄位沒有完美對齊的 .rpt 報告，最穩健的做法是使用「標題行 (Header) 的字元索引位置」來動態切割固定寬度 (Fixed-width) 的資料，而不是使用單純的空白字元分割 (split())。
 
-Markdown
-# 角色與任務目標 (Role & Objective)
-你是一位精通「電子設計自動化（EDA）」與「機器學習（Machine Learning）」的跨領域首席方法學工程師。你的任務是實作一套基於 Python、Pandas 與 HDBSCAN 的「無監督時序違規路徑分群系統（Unsupervised STA Violation Clustering System）」。
+因為報告中的數值通常是靠右對齊標題，我們可以用 Python 讀取標題行，找出每個欄位名稱的 start 與 end 位置，並計算出欄位與欄位之間的「中位數」作為切割邊界。這樣就能完美抓取數值並辨識出真正的空白欄位。
 
-我們已經擁有一個高吞吐量的 Parser，將百萬條 PrimeTime 靜態時序分析（STA）違規路徑轉換成了極簡的 JSONL 格式（`paths.jsonl`）。
-我們**嚴格禁止**依賴模糊的字串比對（如 Jaccard Similarity、NLP）或撰寫複雜的正則表達式來猜測 APR 工具的流水號，因為那會導致維度爆炸與群組發散。
+以下是為這類 PrimeTime 報告撰寫的動態解析 Python 腳本：
 
-你的目標是：建立一套**「純粹基於數值拓撲特徵與幾何密度（Topology & Density-based）」**的分群管線。透過將離散的物理約束型別進行「硬分流（Hard Stratification）」，並在純連續實數空間中利用 HDBSCAN 的互可達距離（Mutual Reachability Distance）來包容走線延遲的微小浮動，最終產出具備高度工程指導價值的「客觀瓶頸收斂報告」。
+Python
+import re
 
----
+def parse_pt_rpt(file_path):
+    parsed_data = []
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+        
+    header_line = None
+    data_start_idx = 0
+    
+    # 1. 尋找標題行 (Header)
+    for i, line in enumerate(lines):
+        # 利用報告中特有的欄位名稱定位標題行
+        if "Cap" in line and "DTrans" in line and "Trans" in line:
+            header_line = line
+            # 通常下一行是 '---' 分隔線，再下一行才是資料
+            data_start_idx = i + 2  
+            break
+            
+    if not header_line:
+        print("找不到標題行！")
+        return []
+        
+    # 2. 動態計算欄位邊界 (Boundaries)
+    # 找出標題行中每個單字的起始與結束字元索引
+    headers = list(re.finditer(r'\S+', header_line))
+    boundaries = []
+    
+    # PT 報告最左側通常有路徑/節點名稱 (Point/Pin)，其標題往往是隱含的或不在同一行
+    # 我們將第一個明確標題 (Cap) 前面的所有空間，歸類為 "Point" 欄位
+    first_header_start = headers[0].start()
+    boundaries.append({
+        "name": "Point",
+        "start": 0,
+        "end": first_header_start - 2 # 留一點緩衝
+    })
+    
+    # 計算其餘標題的動態切割邊界
+    for i in range(len(headers)):
+        header_name = headers[i].group()
+        
+        # 該欄位的起始位置：前一個標題與目前標題之間的空白中點
+        if i == 0:
+            start_pos = first_header_start - 2
+        else:
+            prev_end = headers[i-1].end()
+            curr_start = headers[i].start()
+            start_pos = (prev_end + curr_start) // 2
+            
+        # 該欄位的結束位置：目前標題與下一個標題之間的空白中點
+        if i == len(headers) - 1:
+            end_pos = 9999  # 最後一個欄位 (Voltage) 直接抓到行尾
+        else:
+            curr_end = headers[i].end()
+            next_start = headers[i+1].start()
+            end_pos = (curr_end + next_start) // 2
+            
+        boundaries.append({
+            "name": header_name,
+            "start": start_pos,
+            "end": end_pos
+        })
+        
+    # 3. 讀取並切割每一行資料
+    for line in lines[data_start_idx:]:
+        # 遇到分隔線或空行代表區塊結束，或是無效行[cite: 1]
+        if line.strip().startswith('---') or not line.strip():
+            continue 
+            
+        row_data = {}
+        is_empty_row = True
+        
+        for bound in boundaries:
+            # 根據計算出的邊界絕對位置切割字串，並去除前後空白
+            cell_str = line[bound["start"]:bound["end"]].strip()
+            
+            # 若 cell_str 為空，代表該欄位確實是空白的
+            if cell_str:
+                row_data[bound["name"]] = cell_str
+                is_empty_row = False
+            else:
+                row_data[bound["name"]] = None  # 標記為空白欄位
+                
+        # 避免將純空白行加入資料中
+        if not is_empty_row:
+            parsed_data.append(row_data)
+        
+    return parsed_data
 
-# 階段一：資料輸入與特徵展平 (Data Ingestion & Feature Flattening)
+# 執行與測試
+# data = parse_pt_rpt("your_report_file.rpt")
+# for row in data[:5]:
+#     print(row)
+腳本運作原理解析
+動態邊界定位：程式利用 re.finditer 找到 Cap、DTrans、Trans 等標題的位置[cite: 1]。接著計算標題與標題之間的「中位數」作為字串切片的邊界。因為 PrimeTime 的數值通常對齊標題的右側，這種作法能確保數值不會被切斷或歸錯欄位。
 
-## 1. 輸入資料結構 (JSONL Schema)
-系統將讀取 `paths.jsonl`，每一行代表一條時序違規路徑，格式如下：
-```json
-{
-  "le": [16, 129],
-  "at": "MAX_DELAY_ONLY",
-  "lc": "core_clk",
-  "cc": "core_clk",
-  "cr": 0.25,
-  "sk": -450.12,
-  "seg": [
-    ["u_top", 10.5, "c", 8.0, "u_top/buf_1", 2],
-    ["u_mac", 450.0, "c", 400.0, "u_mac/add_stage_1", 1]
-  ]
-}
-欄位意義：le (行號範圍), at (Archetype 約束型別), lc/cc (收發時鐘), cr (Constraint Penalty Ratio, 預算損耗比), sk (Slack), seg (路徑區段陣列，格式為 [region, delay, pt, pd, pn, th])。
+空白欄位辨識：在固定的字串區段內（例如 line[45:58]），如果使用 .strip() 清除空白後得到空字串 ""，程式就會將其判定為 None，成功解決連續空白導致 split() 錯位的問題。
 
-2. 動態陣列展平與連續數值特徵萃取 (Flattening to Continuous Metrics)
-演算法無法直接處理長短不一的 seg 陣列。你必須在讀取 JSONL 時，將其展開為一個固定欄位的 Pandas DataFrame。
-請針對每條路徑計算並提取以下特徵（這是維持空間連續性的核心）：
+處理後綴字元與標記：報告中的數值後方常帶有 * (Violated)、r (Rising)、f (Falling)、H 等狀態標記[cite: 1]。此腳本會將它們連同數值一起讀取（例如 "0.082600 f" 或 "0.017700 *"）[cite: 1]。
 
-cr (Float)：直接繼承 JSON 內的 cr 值。代表時鐘樹偏移或外部約束吃掉可用時間預算的比例。
+分離數值與標記 (進階處理)：如果在後續的資料分析中需要純數值，可以在讀取後對 cell_str 進行二次正則表達式過濾：
 
-total_delay (Float)：將 seg 中所有的區段 delay 加總。（這是基礎分母，不作為空間特徵）。
-
-peak_delay_ratio (Float)：
-找出 seg 陣列中最大的 pd（單級最大延遲），計算公式為：max_pd / total_delay。
-物理意義：逼近 1.0 代表極端單點尖刺（Spike），逼近 0.0 代表深層邏輯均勻平攤。
-
-top_seg_ratio (Float)：
-找出 seg 中 delay 總和最大的 region，計算其 delay / total_delay。
-物理意義：這條路徑的延遲是集中在單一 IP 模組內，還是跨越多個模組的長途跋涉。
-
-peak_type (String / Categorical)：
-產生 max_pd 的那個 segment 的 pt（"c" 或 "n"）。
-
-階段二：物理硬分流 (Physical Hard Stratification)
-【絕對禁忌】：不可將離散的標籤型別（如 Archetype 或是 peak_type）轉換為 0/1 後，與連續型數值（如 cr）混合丟進使用歐氏距離的 HDBSCAN。二元特徵會在幾何空間中產生平行的超平面（Hyperplanes），徹底撕裂密度連通性，導致原本連續的群組被錯誤地切碎。
-
-【實作規則】：
-你必須使用 Pandas 的 groupby 功能，將資料集依據「物理與合約特徵」進行硬切分（Partitioning），為每一種組合建立獨立的子空間（Subspace DataFrame）。
-
-分流鍵值 (Partition Keys)：at (Archetype) + lc (Launch Clock) + cc (Capture Clock) + peak_type (Cell 或 Net)。
-
-例如：("REG2REG", "core_clk", "core_clk", "c") 形成一個獨立的 DataFrame。
-
-例外處理：如果某個分流子空間的路徑數量少於 min_cluster_size 的設定值（例如 < 15 條），則跳過 HDBSCAN，直接將這些路徑標記為雜訊群組（Noise, ID = -1）。
-
-階段三：無監督密度聚類 (Density-Based Clustering)
-在每一個獨立的分流子空間內，路徑特徵只剩下純實數的連續變數（cr, peak_delay_ratio, top_seg_ratio）。請在每個子空間中獨立執行以下操作：
-
-1. 特徵標準化 (Standard Scaling)
-使用 sklearn.preprocessing.StandardScaler 對 [cr, peak_delay_ratio, top_seg_ratio] 進行標準化（Z-score normalization）。
-目的：消除特徵之間的量綱差異，確保歐氏距離在各維度上的權重絕對平等。
-
-2. HDBSCAN 分群實作
-使用 hdbscan.HDBSCAN 對標準化後的特徵矩陣進行分群。
-
-核心參數設定要求：
-
-min_cluster_size：設定為 >= 15。這代表我們只關注形成宏觀趨勢的系統性瓶頸。任何少於 15 條路徑的微小聚集都會被視為雜訊。
-
-min_samples：設定為 5（或讓其預設等於 min_cluster_size 亦可，但 5 能保留對高密度核心的敏感度，同時包容邊緣的微小數值浮動）。
-
-metric：使用預設的 'euclidean'（因為我們已經將離散維度硬分流了，此時空間是絕對純淨的連續歐氏空間）。
-
-數學寬容度的實現：請在程式註解中說明，HDBSCAN 的互可達距離（Mutual Reachability Distance）會自動將同一條匯流排上、因為走線長短不一造成的 peak_delay_ratio 微幅抖動，透過高密度連通性包容在同一個 Cluster 中，不會因此碎裂。
-
-階段四：群內熱點統計與特徵歸納 (Intra-Cluster Centroid & Signature Aggregation)
-在 HDBSCAN 為所有路徑貼上全局獨立的 global_cluster_id 後，我們需要為每一個有效的群組（排除 ID = -1 的雜訊）產生一份「客觀的特徵輪廓與戰犯報告」。你不必跨群組交集，請專注於萃取群內代表性指標。
-
-1. 群中心數值輪廓 (Centroid Profiling)
-對每一個 Cluster，計算並記錄其物理狀態中位數（使用 Median 而非 Mean 以抵抗離群值）：
-
-median_cr、median_peak_ratio、median_top_seg_ratio。
-
-worst_slack：該群組中最差的 slack 值。
-
-path_count：該群組涵蓋的總路徑條數。
-
-2. 實體字串的模糊遮罩與投票 (Fuzzy Instance Voting)
-這是整個管線中唯一允許操作字串的地方。目的是為了產出人類工程師可讀的派工建議。
-在每一個 Cluster 中，提取所有路徑對應的最大瓶頸實例名稱 pn（Peak Instance Name），並執行以下輕量級清洗：
-
-遮罩流水號與匯流排：使用 Regex 將字串末端的數字、工具常見後綴剔除。
-
-將 _[0-9]+_ 替換為 _*_。
-
-將 \[[0-9]+\] 替換為 [*]。
-
-將 _rep[0-9]+ 或 _ECO_[0-9]+ 替換為空字串。
-
-統計最高頻率（Majority Vote）：
-使用 Pandas 的 value_counts()，找出遮罩後出現頻率最高的那個字串，定義為該 Cluster 的 dominant_bottleneck_signature（主導瓶頸簽名），並計算其佔比（例如：該簽名涵蓋了群內 85% 的路徑）。
-
-最終交付產物 (Expected Deliverables)
-請輸出完整的 Python 3 程式碼。程式碼必須包含：
-
-模組化設計：獨立的函數負責讀取/展平 JSONL、執行硬分流與 HDBSCAN、統計群集輪廓。
-
-邊界防禦邏輯：確保資料不足以形成群集的分流空間能優雅地 fallback 到 Noise (-1)。
-
-產出報表：程式最終需印出一個漂亮的 Pandas DataFrame 摘要（Cluster Summary Report），欄位必須包含：
-[Cluster_ID, Archetype, Peak_Type, Path_Count, Worst_Slack, Median_CR, Median_Peak_Ratio, Dominant_Bottleneck_Signature, Signature_Coverage_Pct]
+Python
+# 將 "0.082600 f" 拆分為數值與標記
+match = re.match(r"([-+]?\d*\.?\d+)\s*(.*)", cell_str)
+if match:
+    value = float(match.group(1))
+    flag = match.group(2) # 得到 'f', 'r', '*' 或空字串
