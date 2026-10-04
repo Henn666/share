@@ -83,3 +83,130 @@ SELECT
 
 FROM raw_paths p
 LEFT JOIN v_path_data_metrics m ON p.run_id = m.run_id AND p.path_id = m.path_id;
+
+
+
+
+plan.md: Timing Report Stage 1 Classification Pipeline1. 模組定位與設計目標模組定位：負責在 PrimeTime 文字報表完成 Parquet 結構化落盤後的第一階段粗略分群（Stage 1），直接以 DuckDB 視圖（View）實作。核心原則：完全解耦延遲與 Slack：本階段絕不讀取 slack、data_arrival、data_required、data_path_delay，避免 SDC 假違規干擾責任劃分。正交雙維度標籤：每條路徑輸出兩個互斥且正交的標籤——實體責任分群（stage1_group）與時脈排程客觀狀態（clock_window_status）。自適應時脈檢驗（去除 50ps 寫死漏洞）：廢除硬編碼的 50ps 整除邏輯，改採「時脈基準有理數倍率（Rational Multiplier Ratio）」與「時脈對離散熵值（Dispersion Entropy）」，完美相容 133.33MHz、66.66MHz 等非 50ps 步進的特殊頻率。2. 輸入資料欄位規格（Input Table: raw_paths）Parser 寫入 DuckDB / Parquet 時必須提供以下幾何與時序邊界欄位：欄位名稱資料型態單位說明path_idVARCHAR-路徑唯一識別碼（Primary Key）launch_clkVARCHAR-發射時脈名稱capture_clkVARCHAR-接收時脈名稱launch_periodDOUBLEns發射時脈週期（$T_{\text{launch}}$，由時脈定義或相鄰 edge 推導）capture_periodDOUBLEns接收時脈週期（$T_{\text{capture}}$）launch_edgeDOUBLEns發射沿時間戳記（$t_{\text{launch\_edge}}$）capture_edgeDOUBLEns捕獲沿時間戳記（$t_{\text{capture\_edge}}$）start_partitionVARCHAR-發射端所屬實體分區（例如 'u_cpu', 'TOP'）end_partitionVARCHAR-接收端所屬實體分區is_chip_ioBOOLEAN-起點或終點是否為 Chip Pad / Bump / Porttraversed_partition_countINTEGER個該路徑節點踏過之實體分區去重總數top_functional_gate_countINTEGER個沿途在 Top 層經過的功能邏輯閘總數（排除 BUF / INV）3. 分類維度一：實體責任分群（stage1_group）依據晶片邊界、實體階層穿透性與頂層功能閘特徵，收斂為 6 大互斥責任群組：CHIP_IO：條件：is_chip_io = TRUE對象：Package 封裝團隊 / IO Pad 整合工程師。BLOCK_INTERNAL：條件：start_partition = end_partition AND traversed_partition_count = 1 AND start_partition != 'TOP'對象：該模組負責人（Block Owner），頂層簽核直接略過。DETOUR_LOOP：條件：start_partition = end_partition AND traversed_partition_count > 1 AND start_partition != 'TOP'對象：Top-level APR 工程師（借道折返，需設 Route Guide 壓制）。TOP_INTERFACE：條件：(start_partition = 'TOP' AND end_partition != 'TOP') OR (start_partition != 'TOP' AND end_partition = 'TOP')對象：Top 整合工程師與該 Block Owner 協同排查。BLOCK_CROSS_WIRE：條件：start_partition != end_partition 且起迄均不為 'TOP'，且 top_functional_gate_count = 0對象：Floorplan Lead（純走線中繼，物理距離過遠，需挪動 Block 位置或插入硬體 Pipeline 暫存器）。BLOCK_CROSS_LOGIC：條件：start_partition != end_partition 且起迄均不為 'TOP'，且 top_functional_gate_count > 0對象：NoC / Interconnect 總線架構工程師（跨模組經過總線、仲裁或膠水邏輯）。TOP_INTERNAL：條件：start_partition = 'TOP' AND end_partition = 'TOP'對象：Top-level RTL 開發人員。4. 分類維度二：時脈排程客觀狀態（clock_window_status）定義基礎排程時間差：$$\Delta t_{\text{window}} = t_{\text{capture\_edge}} - t_{\text{launch\_edge}}$$定義較快時脈的基準週期：$$T_{\text{ref}} = \min(T_{\text{launch}}, T_{\text{capture}})$$計算週期有理數倍率係數：$$k = \frac{\Delta t_{\text{window}}}{T_{\text{ref}}}$$4.1 窗口客觀異常指標指標一：物理不可達極限（Absolute Physical Collapse）定義：$\Delta t_{\text{window}} < 0.100\text{ns}$ 或 $\le 0.000\text{ns}$。依據：Flip-Flop 的硬體極限 $T_{\text{clk-to-q}} + T_{\text{setup}} \approx 0.07\text{ns} \sim 0.12\text{ns}$，小於 100ps 包含 multicycle_path 0、波形 High Pulse 填錯或反向排程，無論同頻或跨頻均 100% 為約束崩潰。指標二：時脈對窗口離散熵值異常（Window Dispersion Entropy）定義：在相同的 (launch_clk, capture_clk) 配對下，相異窗口總數大於或等於 3 種：$$\text{COUNT}(\text{DISTINCT } \text{ROUND}(\Delta t_{\text{window}}, 3)) \ge 3$$依據：真實同步跨頻介面的排程窗口只有 1 種（同緣）或至多 2 種（雙緣）。出現 $\ge 3$ 種代表兩時脈在時間軸上滑動，EDA 工具展開 LCM 時碰巧對齊到隨機相鄰邊緣。指標三：非標準週期倍率殘餘（Non-Rational Ratio Residue）定義：倍率係數 $k$ 偏離常見的合法工程有理數集合：$$k \notin \{0.5, 1.0, 1.5, 2.0, 3.0, 4.0\} \quad (\text{容許 } \pm 2\% \text{ 浮點捨入誤差})$$依據：無論是 1GHz 還是 133.33MHz，真實同步衍生時鐘在硬體上的排程時間只會是半週期（$0.5T$）、單週期（$1.0T$）或多週期（$2.0T$ 等）。非整數或奇異小數倍率（如 $k = 0.37$）必為未約束非同步波形的碎片。4.2 狀態分類判準與優先級Plaintext                                [計算路徑排程窗口]
+                                        │
+           ┌────────────────────────────┴────────────────────────────┐
+           ▼                                                         ▼
+[Δt_window < 0.1ns 或 <= 0ns]                               [Δt_window >= 0.1ns]
+           │                                                         │
+           ▼                                       ┌─────────────────┴─────────────────┐
+  COLLAPSED_WINDOW                                 ▼                                   ▼
+(約束崩潰/物理不可達)                        [launch_clk == capture_clk]         [launch_clk != capture_clk]
+                                                   │                                   │
+                                                   ▼                                   ▼
+                                              SAME_CLOCK                     [檢查指標二與指標三]
+                                            (內部同步放行)                             │
+                                                           ┌───────────────────────────┴───────────────────────────┐
+                                                           ▼                                                       ▼
+                                            [同Pair窗口數 >= 3 OR 倍率 k 異常]                   [同Pair窗口數 <= 2 AND 倍率 k 正常]
+                                                           │                                                       │
+                                                           ▼                                                       ▼
+                                                   FRAGMENTED_WINDOW                           CROSS_CLOCK_VALID_WINDOW
+                                                  (非同步滑移SDC洩漏)                            (排程正常，保留嫌疑放行)
+COLLAPSED_WINDOW：$\Delta t_{\text{window}} < 0.100\text{ns}$ 或 $\le 0.000\text{ns}$。SAME_CLOCK：launch_clk = capture_clk 且 $\Delta t_{\text{window}} \ge 0.100\text{ns}$。FRAGMENTED_WINDOW：launch_clk != capture_clk，$\Delta t_{\text{window}} \ge 0.100\text{ns}$，且滿足「指標二（種類 $\ge 3$）」或「指標三（倍率 $k$ 異常）」。CROSS_CLOCK_VALID_WINDOW：launch_clk != capture_clk，$\Delta t_{\text{window}} \ge 0.100\text{ns}$，且同時脈對窗口數 $\le 2$ 且倍率 $k$ 正常。5. DuckDB SQL 完整實作代碼SQL-- ============================================================================
+-- 步驟 1: 計算跨時鐘配對的離散熵值 (Window Dispersion Entropy)
+-- ============================================================================
+CREATE OR REPLACE VIEW v_clock_pair_entropy AS
+SELECT 
+    launch_clk,
+    capture_clk,
+    COUNT(DISTINCT ROUND(capture_edge - launch_edge, 3)) AS distinct_windows
+FROM raw_paths
+WHERE launch_clk != capture_clk
+GROUP BY launch_clk, capture_clk;
+
+-- ============================================================================
+-- 步驟 2: Stage 1 雙維度分類主視圖 (v_stage1_classified)
+-- ============================================================================
+CREATE OR REPLACE VIEW v_stage1_classified AS
+WITH path_metrics AS (
+    SELECT 
+        p.*,
+        ROUND(p.capture_edge - p.launch_edge, 4) AS delta_window,
+        LEAST(p.launch_period, p.capture_period) AS t_ref,
+        ROUND((p.capture_edge - p.launch_edge) / LEAST(p.launch_period, p.capture_period), 2) AS k_ratio,
+        COALESCE(e.distinct_windows, 1) AS pair_distinct_windows
+    FROM raw_paths p
+    LEFT JOIN v_clock_pair_entropy e 
+           ON p.launch_clk = e.launch_clk 
+          AND p.capture_clk = e.capture_clk
+)
+SELECT 
+    path_id,
+    launch_clk,
+    capture_clk,
+    launch_edge,
+    capture_edge,
+    delta_window AS timing_window,
+
+    -- ------------------------------------------------------------------------
+    -- 維度一：實體責任分群 (stage1_group)
+    -- ------------------------------------------------------------------------
+    CASE 
+        WHEN is_chip_io = TRUE 
+            THEN 'CHIP_IO'
+
+        WHEN start_partition = end_partition 
+             AND traversed_partition_count = 1 
+             AND start_partition != 'TOP'
+            THEN 'BLOCK_INTERNAL'
+
+        WHEN start_partition = end_partition 
+             AND traversed_partition_count > 1 
+             AND start_partition != 'TOP'
+            THEN 'DETOUR_LOOP'
+
+        WHEN (start_partition = 'TOP' AND end_partition != 'TOP')
+          OR (start_partition != 'TOP' AND end_partition = 'TOP')
+            THEN 'TOP_INTERFACE'
+
+        WHEN start_partition != end_partition 
+             AND start_partition != 'TOP' 
+             AND end_partition != 'TOP' THEN
+            CASE 
+                WHEN top_functional_gate_count > 0 THEN 'BLOCK_CROSS_LOGIC'
+                ELSE 'BLOCK_CROSS_WIRE'
+            END
+
+        ELSE 'TOP_INTERNAL'
+    END AS stage1_group,
+
+    -- ------------------------------------------------------------------------
+    -- 維度二：時脈排程客觀狀態 (clock_window_status)
+    -- ------------------------------------------------------------------------
+    CASE 
+        -- 1. 全域守門員：物理不可達極限 (包含 MCP 0、波形錯誤、逆向排程)
+        WHEN delta_window < 0.100 OR delta_window <= 0.000
+            THEN 'COLLAPSED_WINDOW'
+
+        -- 2. 同頻內部同步
+        WHEN launch_clk = capture_clk 
+            THEN 'SAME_CLOCK'
+
+        -- 3. 跨頻非同步洩漏：命中熵值異常 (>= 3) 或非標準工程倍率
+        WHEN pair_distinct_windows >= 3
+          OR k_ratio NOT IN (0.50, 1.00, 1.50, 2.00, 3.00, 4.00)
+            THEN 'FRAGMENTED_WINDOW'
+
+        -- 4. 跨頻正常窗口 (排程正常，保留嫌疑放行後續檢驗)
+        ELSE 'CROSS_CLOCK_VALID_WINDOW'
+    END AS clock_window_status,
+
+    -- 輔助布林標記 (提供下游快速查詢)
+    (launch_clk != capture_clk) AS is_cross_clock
+
+FROM path_metrics;
+6. 下游交付與分流標準（Downstream Handoff）Plaintext[Stage 1 輸出資料集: v_stage1_classified]
+            │
+            ├─► 【阻斷路徑】 clock_window_status IN ('COLLAPSED_WINDOW', 'FRAGMENTED_WINDOW')
+            │      └── 處置：100% SDC 約束問題，完全移出物理分析佇列！
+            │                產出清單通知 STA 補齊 set_clock_groups 或修正 MCP。
+            │
+            └─► 【放行路徑】 clock_window_status IN ('SAME_CLOCK', 'CROSS_CLOCK_VALID_WINDOW')
+                   └── 處置：放行進入 Stage 2 物理漏斗（Step 1 ~ Step 5）。
+                             若遇到同頻獨立 OCC 等非同步偽裝路徑（排程整齊但 Skew 暴衝），
+                             將在 Stage 2 Step 3 由 Clock Skew 門檻精準攔截。
