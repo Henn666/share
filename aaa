@@ -1,36 +1,85 @@
-二、 四大路徑型態的「等效檢驗條件」1. Reg-to-Reg（暫存器到暫存器）物理公式：$$\text{Data Arrival Time} = \text{Launch Clock Arrival} + \text{Clock-to-Q} + \sum (\text{Data Cell/Net Delay})$$等效檢驗條件：Post-CTS（實體樹）：data_arrival_time < launch_clk_latency(解釋：時脈打到暫存器 CK 腳之後，經過 Q 輸出和邏輯閘，到達時間必定大於時脈延遲。小於就是負延遲。)Pre-CTS（理想時鐘）：在 Pre-CTS 下，理想時脈的起點通常只看 Data Path 本身：$$\sum_{\text{DATA\_PATH}} \text{incr\_delay} < 0$$(解釋：直接檢查點位表中的 Data Path 累加增量延遲是否小於 0。若小於 0，代表有人在 SDC 注入了負的 cell delay 或 derate 算壞。)2. In-to-Reg（外部接腳到內部暫存器）物理公式：$$\text{Data Arrival Time} = T_{\text{launch\_edge}} + \text{input\_external\_delay} + \sum (\text{Data Cell/Net Delay})$$為什麼原本的條件會誤判？因為輸入端根本沒有晶片內部的時脈樹（launch_clk_latency 可能是 0 或未定義）。等效檢驗條件：真錯誤情況：外部延遲設成了負數，且負得太誇張，導致資料甚至在時脈發射邊緣前就進來了：SQL-- 外部輸入延遲設為負值（人為 SDC 錯誤）
-input_external_delay < 0
--- 或者扣除外部延遲後，晶片內部的純資料走線居然是負延遲
-(data_arrival_time - input_external_delay) < 0
-3. Reg-to-Out（內部暫存器到外部接腳）物理公式：$$\text{Data Required Time} = T_{\text{capture\_edge}} + \text{Capture Latency} - \text{output\_external\_delay} - \text{Setup}$$等效檢驗條件：真錯誤情況：外部負載或輸出延遲設錯（例如把 output delay 設得比整個時脈週期還大，直接把時間吃光甚至壓成負數）：SQL-- 外部需求合約設錯，要求時間甚至比時脈發射時間還早
-data_required_time < launch_clk_edge_time
-三、 統一落地成 DuckDB 的「分類等效規則」在寫入 DuckDB 後，不需要寫很雜亂的巢狀邏輯，只要用一個 CASE WHEN 依據路徑類型（path_type_category）走各自嚴格的等效條件：SQLSELECT 
-    path_id,
-    slack,
-    startpoint,
-    endpoint,
+依據前述討論的「5 步漏斗架構」與「零誤報」原則，將原本雜亂的標籤重構成一套層次分明、責任歸屬清晰的兩層式分類體系（parent_type + child_type）。這套分類在 DuckDB 內直接對應 2 個欄位：err_type（大類 / 檢驗關卡）err_subtype（具體病因）另含 check_status（ERROR / VALID）時序路徑多層漏斗分類架構表Plaintext[原始 Timing Path 報表]
+  │
+  ├─► STEP 1: 時鐘與約束合法性 (Clock & SDC Legality)  ➔ 排除：假路徑、波形倒退、未約束
+  ├─► STEP 2: 外部邊界合約合理性 (IO Budget)          ➔ 排除：外部延遲設錯、負合約
+  ├─► STEP 3: 時鐘樹偏斜與物理性 (CTS & Skew)         ➔ 抓出：長樹不平衡、實體時鐘缺陷
+  ├─► STEP 4: 建模異常與物理極端值 (Modeling Artifact) ➔ 排除：查表外推爆表、負增量延遲
+  │
+  ▼ (前 4 關全數 PASS，確認為「真實可修復的內部 Data 違規」)
+STEP 5: 真實硬體資料路徑瓶頸 (Actionable Data Path Bottlenecks)
+詳細分類對照表 (DuckDB 規則映射)err_type (Parent / 關卡)err_subtype (Child / 具體病因)判定條件 (純文字報表可得)根本責任歸屬 / 解法STEP1_CLOCK_SDC(時鐘與約束合法性)UNCONSTRAINED_CLOCKlaunch_clk / capture_clk 為 default、none 或 path_group = '**default**'前端/STA：漏設 create_clockNEGATIVE_EDGE_WINDOWcapture_edge < launch_edge前端/STA：CDC 漏 False Path，或 MCP 設反   NEGATIVE_PROPAGATIONis_propagated = TRUE 且 reg2reg 且 data_arrival < launch_latency前端/STA：時鐘延遲計算錯位或人為破壞因果律   STEP2_IO_BUDGET(外部邊界合約)NEGATIVE_INPUT_DELAYstartpoint 為 InPort 且 input_external_delay < 0頂層整合：SDC 外部輸入延遲設為負數   NEGATIVE_OUTPUT_DELAYendpoint 為 OutPort 且 output_external_delay < 0頂層整合：SDC 外部輸出延遲設為負數   OVERCONSTRAINED_IOinput_external_delay 或 output_external_delay 吃滿整個 Required 時間軸頂層整合：系統合約過緊，需放寬介面 SDCSTEP3_CLOCK_SKEW(實體時鐘樹缺陷)BAD_CLOCK_SKEWis_propagated = TRUE 且 reg2reg 且 clock_skew < -0.300 (Setup 嚴重劣勢)APR：CTS 時脈樹不平衡，需重調 CTS SpecMISSING_CRPR共用時脈路徑長但未開 CPPR，導致悲觀延遲累積APR/STA：檢查 Signoff 腳本是否開啓 CRPRSTEP4_MODELING_ARTIFACT(建模異常與軟體雜訊)NEGATIVE_INCR_DELAYpath_segment = 'DATA_PATH' 且任一節點之 incr_delay < -0.002Library/工具：SI/Crosstalk 極端計算異常   LUT_EXTRAPOLATION單一 Cell 延遲 > 1.5ns 或 Transition > 1.0ns（查表超出 Liberty 範圍）APR：長線斷線未加 Buffer，急需插入 BufferSTEP5_TRUE_BOTTLENECK(真實硬體資料路徑瓶頸)NET_ROUTING_DOMINATED通過前 4 關，且 Data Path 中走線延遲佔比 Net Delay Ratio > 60%APR：走線過長或 Detour 擁塞，需調 FloorplanSINGLE_GATE_DOMINATED通過前 4 關，且單一邏輯閘吃掉 Data Path 總延遲 > 40%APR：驅動太弱，執行 size_cell 換大驅動單元HIGH_FANOUT_LOAD通過前 4 關，且節點 fanout > 32 或 Transition 劣化APR：高負載，執行 Gate Cloning 或長 Buffer TreeLOGIC_DEPTH_TOO_DEEP通過前 4 關，且 true_logic_depth > 25數位前端：RTL 邏輯層數過深，需重構管線 (Pipeline)MARGINAL_AUTO_FIX通過前 4 關，且 -0.015 <= slack < 0APR：極微小違規，留給 EDA 工具做最後微調二、 在 DuckDB 中的視圖架構 (SQL View 落地)這種分類方式在 DuckDB 內直接使用瀑布流（Waterfall CASE WHEN），順序即代表漏斗關卡：SQLCREATE OR REPLACE VIEW v_path_classified AS
+SELECT 
+    p.*,
     CASE 
-        -- 【情境 1：波形排程倒流】所有類型通用：捕獲沿在發射沿之前
-        WHEN capture_edge_time < launch_edge_time 
-            THEN 'ERR_SDC_NEGATIVE_EDGE_WINDOW'
+        -- STEP 1: 時鐘與約束合法性
+        WHEN p.launch_clk IN ('(default)', 'none', 'unconstrained') 
+             OR p.path_group = '**default**'
+            THEN 'STEP1_CLOCK_SDC'
+        WHEN p.capture_edge < p.launch_edge
+            THEN 'STEP1_CLOCK_SDC'
+        WHEN p.is_propagated = TRUE 
+             AND p.path_type_category = 'reg2reg' 
+             AND p.data_arrival < p.launch_latency
+            THEN 'STEP1_CLOCK_SDC'
 
-        -- 【情境 2：Reg-to-Reg 且 Post-CTS】時脈到達後，資料到達時間居然倒退
-        WHEN is_propagated = TRUE 
-             AND startpoint NOT LIKE '%(in)%' 
-             AND endpoint NOT LIKE '%(out)%'
-             AND data_arrival_time < launch_clk_latency 
-            THEN 'ERR_REG2REG_NEGATIVE_PROPAGATION'
+        -- STEP 2: 外部邊界合約
+        WHEN p.path_type_category = 'in2reg' AND p.input_external_delay < 0
+            THEN 'STEP2_IO_BUDGET'
+        WHEN p.path_type_category = 'reg2out' AND p.output_external_delay < 0
+            THEN 'STEP2_IO_BUDGET'
 
-        -- 【情境 3：In-to-Reg】外部延遲設成負數導致因果破壞
-        WHEN startpoint LIKE '%(in)%' 
-             AND input_external_delay < 0 
-            THEN 'ERR_IN2REG_NEGATIVE_EXTERNAL_DELAY'
+        -- STEP 3: 時鐘樹偏斜
+        WHEN p.is_propagated = TRUE 
+             AND p.path_type_category = 'reg2reg' 
+             AND p.clock_skew < -0.300
+            THEN 'STEP3_CLOCK_SKEW'
 
-        -- 【情境 4：所有類型通用】Data Path 內部純閘與走線累計延遲為負數
-        WHEN data_path_delay < 0 
-            THEN 'ERR_PURE_DATA_NEGATIVE_DELAY'
+        -- STEP 4: 建模極端異常
+        WHEN m.has_negative_incr = TRUE 
+             OR m.has_lut_extrapolation = TRUE
+            THEN 'STEP4_MODELING_ARTIFACT'
 
-        ELSE 'VALID_PHYSICAL_PATH'
-    END AS legality_check_status
-FROM raw_paths;
-總結這樣做就對了！分清舞台：Pre-CTS 不看 Latency 差值，改看 Data Path 淨延遲。分清角色：In2Reg 檢查 input_delay，Reg2Reg 檢查 arrival vs latency。
+        -- STEP 5: 通過前 4 關，進入真實資料路徑診斷
+        ELSE 'STEP5_TRUE_BOTTLENECK'
+    END AS err_type,
+
+    CASE 
+        -- STEP 1 細項
+        WHEN p.launch_clk IN ('(default)', 'none', 'unconstrained') OR p.path_group = '**default**'
+            THEN 'UNCONSTRAINED_CLOCK'
+        WHEN p.capture_edge < p.launch_edge
+            THEN 'NEGATIVE_EDGE_WINDOW'
+        WHEN p.is_propagated = TRUE AND p.path_type_category = 'reg2reg' AND p.data_arrival < p.launch_latency
+            THEN 'NEGATIVE_PROPAGATION'
+
+        -- STEP 2 細項
+        WHEN p.path_type_category = 'in2reg' AND p.input_external_delay < 0
+            THEN 'NEGATIVE_INPUT_DELAY'
+        WHEN p.path_type_category = 'reg2out' AND p.output_external_delay < 0
+            THEN 'NEGATIVE_OUTPUT_DELAY'
+
+        -- STEP 3 細項
+        WHEN p.is_propagated = TRUE AND p.path_type_category = 'reg2reg' AND p.clock_skew < -0.300
+            THEN 'BAD_CLOCK_SKEW'
+
+        -- STEP 4 細項
+        WHEN m.has_negative_incr = TRUE THEN 'NEGATIVE_INCR_DELAY'
+        WHEN m.has_lut_extrapolation = TRUE THEN 'LUT_EXTRAPOLATION'
+
+        -- STEP 5 細項 (依物理特徵排序)
+        WHEN m.net_delay_ratio > 0.60 THEN 'NET_ROUTING_DOMINATED'
+        WHEN m.max_cell_delay_ratio > 0.40 THEN 'SINGLE_GATE_DOMINATED'
+        WHEN m.max_fanout > 32 THEN 'HIGH_FANOUT_LOAD'
+        WHEN m.logic_depth > 25 THEN 'LOGIC_DEPTH_TOO_DEEP'
+        WHEN p.slack >= -0.015 THEN 'MARGINAL_AUTO_FIX'
+        ELSE 'COMPLEX_MIXED'
+    END AS err_subtype,
+
+    -- 狀態標記：前 4 步都是約束或環境缺陷 (ERROR)，第 5 步才是待修實體電路 (ACTIONABLE)
+    CASE 
+        WHEN err_type IN ('STEP1_CLOCK_SDC', 'STEP2_IO_BUDGET', 'STEP4_MODELING_ARTIFACT') THEN 'INVALID_OR_ARTIFACT'
+        ELSE 'ACTIONABLE'
+    END AS triage_status
+
+FROM raw_paths p
+LEFT JOIN v_path_data_metrics m ON p.run_id = m.run_id AND p.path_id = m.path_id;
