@@ -1,183 +1,36 @@
-這是一份完全聚焦在 「從 Text Report ➔ 串流讀取 (Reader) ➔ 記憶體物件 ➔ 寫入 DuckDB/Parquet」 的極簡且嚴密規格書 plan.md，已將後續分析邏輯全部剃除，專注於解析與落盤的實作細節與避坑指南。
+二、 四大路徑型態的「等效檢驗條件」1. Reg-to-Reg（暫存器到暫存器）物理公式：$$\text{Data Arrival Time} = \text{Launch Clock Arrival} + \text{Clock-to-Q} + \sum (\text{Data Cell/Net Delay})$$等效檢驗條件：Post-CTS（實體樹）：data_arrival_time < launch_clk_latency(解釋：時脈打到暫存器 CK 腳之後，經過 Q 輸出和邏輯閘，到達時間必定大於時脈延遲。小於就是負延遲。)Pre-CTS（理想時鐘）：在 Pre-CTS 下，理想時脈的起點通常只看 Data Path 本身：$$\sum_{\text{DATA\_PATH}} \text{incr\_delay} < 0$$(解釋：直接檢查點位表中的 Data Path 累加增量延遲是否小於 0。若小於 0，代表有人在 SDC 注入了負的 cell delay 或 derate 算壞。)2. In-to-Reg（外部接腳到內部暫存器）物理公式：$$\text{Data Arrival Time} = T_{\text{launch\_edge}} + \text{input\_external\_delay} + \sum (\text{Data Cell/Net Delay})$$為什麼原本的條件會誤判？因為輸入端根本沒有晶片內部的時脈樹（launch_clk_latency 可能是 0 或未定義）。等效檢驗條件：真錯誤情況：外部延遲設成了負數，且負得太誇張，導致資料甚至在時脈發射邊緣前就進來了：SQL-- 外部輸入延遲設為負值（人為 SDC 錯誤）
+input_external_delay < 0
+-- 或者扣除外部延遲後，晶片內部的純資料走線居然是負延遲
+(data_arrival_time - input_external_delay) < 0
+3. Reg-to-Out（內部暫存器到外部接腳）物理公式：$$\text{Data Required Time} = T_{\text{capture\_edge}} + \text{Capture Latency} - \text{output\_external\_delay} - \text{Setup}$$等效檢驗條件：真錯誤情況：外部負載或輸出延遲設錯（例如把 output delay 設得比整個時脈週期還大，直接把時間吃光甚至壓成負數）：SQL-- 外部需求合約設錯，要求時間甚至比時脈發射時間還早
+data_required_time < launch_clk_edge_time
+三、 統一落地成 DuckDB 的「分類等效規則」在寫入 DuckDB 後，不需要寫很雜亂的巢狀邏輯，只要用一個 CASE WHEN 依據路徑類型（path_type_category）走各自嚴格的等效條件：SQLSELECT 
+    path_id,
+    slack,
+    startpoint,
+    endpoint,
+    CASE 
+        -- 【情境 1：波形排程倒流】所有類型通用：捕獲沿在發射沿之前
+        WHEN capture_edge_time < launch_edge_time 
+            THEN 'ERR_SDC_NEGATIVE_EDGE_WINDOW'
 
-Markdown
-# PrimeTime Timing Report Parser & Ingestion Pipeline Spec (plan.md)
+        -- 【情境 2：Reg-to-Reg 且 Post-CTS】時脈到達後，資料到達時間居然倒退
+        WHEN is_propagated = TRUE 
+             AND startpoint NOT LIKE '%(in)%' 
+             AND endpoint NOT LIKE '%(out)%'
+             AND data_arrival_time < launch_clk_latency 
+            THEN 'ERR_REG2REG_NEGATIVE_PROPAGATION'
 
-## 1. 模組目標與範圍
-本模組專注於完成第一階段資料管線：**將 PrimeTime 原始文字報告（Text Report）忠實解析，並以低記憶體（$O(1)$ Memory）、高吞吐量的方式寫入列式儲存（Parquet / DuckDB）**。
-本階段不進行任何特徵推論或時序根因分析，確保原始資料完全保真（High Fidelity）。
+        -- 【情境 3：In-to-Reg】外部延遲設成負數導致因果破壞
+        WHEN startpoint LIKE '%(in)%' 
+             AND input_external_delay < 0 
+            THEN 'ERR_IN2REG_NEGATIVE_EXTERNAL_DELAY'
 
----
+        -- 【情境 4：所有類型通用】Data Path 內部純閘與走線累計延遲為負數
+        WHEN data_path_delay < 0 
+            THEN 'ERR_PURE_DATA_NEGATIVE_DELAY'
 
-## 2. 系統架構與資料流 (Streaming Flow)
-
-[PrimeTime .rpt (純文字檔案)]
-│
-▼ 逐行讀取 (Line-by-line)
-【1. reader.py: 正則狀態機引擎】
-
-提取 Startpoint / Endpoint / Slack / Skew / CRPR
-
-自動判斷 Pre-CTS (Ideal) 與 Post-CTS (Propagated)
-
-區分 Launch Clock, Data Path, Capture Clock
-│
-▼ 逐條產生 (yield Python Dict，記憶體中僅佔單條路徑大小)
-【2. sink.py: 微批次寫入緩衝區 (Micro-batch Buffer)】
-
-累積 Path 與 Points 資料（預設 Batch Size = 50,000）
-
-滿額後使用 PyArrow 轉換為 Arrow RecordBatch
-│
-▼ 批次 Flush 落盤 (Snappy 壓縮)
-【3. 實體二進位儲存層 (Storage)】
-├── raw_paths.parquet   (路徑級別純量屬性)
-└── raw_points.parquet  (沿途點位詳細屬性)
-│
-▼ 零拷貝掛載 (Zero-copy Register)
-【4. DuckDB 資料庫載入】
-
-自動建立 DuckDB Views 或實體 Table
-
-
----
-
-## 3. 資料庫 Schema 定義 (DuckDB / Parquet)
-
-採用 **稀疏超集模式（Sparse Superset Schema）**，保證同一套 Schema 同時相容 Pre-CTS 與 Post-CTS 報告。
-
-### 表 1: `raw_paths` (路徑主表)
-| 欄位名稱 | 型別 | 說明 | Pre-CTS (Ideal) | Post-CTS (Propagated) |
-| :--- | :--- | :--- | :--- | :--- |
-| `run_id` | VARCHAR | 執行輪次名稱（如 `run_01`） | 必要填入 | 必要填入 |
-| `path_id` | INT64 | 檔案內唯一路徑遞增編號 (1, 2, 3...) | 必要填入 | 必要填入 |
-| `path_signature` | VARCHAR | 邏輯識別 Hash: `MD5(startpoint + endpoint + launch_clk + capture_clk)` | 必要填入 | 必要填入 |
-| `slack` | FLOAT | 時序 Slack 數值 | 數值 | 數值 |
-| `slack_status` | VARCHAR | `'VIOLATED'` 或 `'MET'` | 必要填入 | 必要填入 |
-| `path_group` | VARCHAR | Timing Path Group 名稱 | 數值或字串 | 數值或字串 |
-| `path_type` | VARCHAR | `'max'` (Setup) 或 `'min'` (Hold) | 數值 | 數值 |
-| `startpoint` | VARCHAR | 起點 Pin 或 Port 名稱 | 必要填入 | 必要填入 |
-| `endpoint` | VARCHAR | 終點 Pin 或 Port 名稱 | 必要填入 | 必要填入 |
-| `launch_clk` | VARCHAR | Launch Clock 名稱 | 必要填入 | 必要填入 |
-| `capture_clk` | VARCHAR | Capture Clock 名稱 | 必要填入 | 必要填入 |
-| `clock_period` | FLOAT | 時脈週期（若非同步為 0.0） | 數值 | 數值 |
-| `is_propagated` | BOOLEAN | 是否為實體時脈樹 | `FALSE` | `TRUE` |
-| `data_arrival_time` | FLOAT | Data Arrival Time | 數值 | 數值 |
-| `data_required_time`| FLOAT | Data Required Time | 數值 | 數值 |
-| `launch_clk_latency`| FLOAT | 發射端 Clock Network Delay | Ideal Latency 純量 | 實體樹總延遲 |
-| `capture_clk_latency`| FLOAT | 接收端 Clock Network Delay | Ideal Latency 純量 | 實體樹總延遲 |
-| `clock_skew` | FLOAT | `capture_clk_latency - launch_clk_latency` | 估算或 0.0 | 實體計算值 |
-| `clock_uncertainty` | FLOAT | Clock Uncertainty | 數值 | 數值 |
-| `crpr` | FLOAT | Clock Reconvergence Pessimism | **`NULL`** | 數值 |
-
-### 表 2: `raw_points` (節點拓撲明細表)
-| 欄位名稱 | 型別 | 說明 |
-| :--- | :--- | :--- |
-| `run_id` | VARCHAR | 執行輪次名稱 |
-| `path_id` | INT64 | 外鍵，對應 `raw_paths.path_id` |
-| `point_idx` | INT16 | 沿途節點順序 (0, 1, 2, 3...) |
-| `path_segment` | VARCHAR | 列舉：`'LAUNCH_CLOCK'`、`'DATA_PATH'`、`'CAPTURE_CLOCK'` |
-| `pin_name` | VARCHAR | 節點完整 Pin 名稱（如 `u_sub/inst_a/A`） |
-| `instance_name`| VARCHAR | 元件名稱（如 `u_sub/inst_a`；若為 Net 填 `NULL`） |
-| `cell_type` | VARCHAR | 元件型態（如 `NAND2_X1_LVT`；若為 Net 填 `NULL`） |
-| `is_net` | BOOLEAN | 是否為走線節點 (`TRUE`/`FALSE`) |
-| `incr_delay` | FLOAT | 該步驟增量延遲 (Incr) |
-| `total_delay` | FLOAT | 累計延遲 (Path) |
-| `transition` | FLOAT | 訊號轉換時間 (Transition/Slew，無則填 `NULL`) |
-| `fanout` | INT32 | 負載個數 (無則填 `NULL`) |
-
----
-
-## 4. 解析狀態機實作規格 (FSM Implementation)
-
-Reader 必須實作成 Python 生成器（Generator），一次只在記憶體保留一條路徑。
-
-### 狀態切換圖解：
-[STATE_IDLE] ──(遇到 "Startpoint:")──► [STATE_HEADER]
-│
-┌─────────────────────┴─────────────────────┐
-▼ (遇到表格標頭: "Point   Incr   Path")      ▼ (無表格，格式異常)
-[STATE_POINTS: LAUNCH_CLOCK]                       [STATE_ERROR]
-│
-├─(遇到起點觸發器 /Q 或 Input Pin)─► [STATE_POINTS: DATA_PATH]
-│
-├─(遇到 "data arrival time")────────► [STATE_POINTS: CAPTURE_CLOCK]
-│
-▼ (遇到 "data required time" 標頭區段)
-[STATE_TRAILER]
-│
-▼ (遇到 "slack (VIOLATED/MET)")
-[YIELD PATH & RESET TO STATE_IDLE]
-
-
-### 關鍵狀態邏輯：
-1. **Header 階段**：
-   * 搜尋 `Startpoint:`、`Endpoint:`、`Path Group:`。
-   * 檢查時鐘行：若出現 `(propagated)` 則設定 `is_propagated = TRUE`；若出現 `(ideal)` 則設定 `is_propagated = FALSE`。
-2. **Points 階段（分段標籤設定）**：
-   * 進入點位表格時，預設 `current_segment = 'LAUNCH_CLOCK'`。
-   * **Pre-CTS 特性**：沒有 Launch Clock 點位，表格第一筆通常就是 Startpoint 的輸出 Pin（如 `/Q`），狀態機會**直接跳過 LAUNCH_CLOCK 進入 DATA_PATH**。
-   * 遇到暫存器輸出 pin（匹配 `/(?:Q|QN|SO|DOUT)\b`）或輸入 Port 時，狀態切換為 `DATA_PATH`。
-   * 遇到 `data arrival time` 字串時，切換為 `CAPTURE_CLOCK`。
-3. **Trailer 階段**：
-   * 抓取 `clock uncertainty`、`clock reconvergence pessimism` (CRPR)。
-   * 遇到 `slack (VIOLATED)` 或 `slack (MET)` 時：
-     * 將當前暫存的所有點位與路徑資訊封裝為 Python `dict`。
-     * 執行 `yield path_dict`。
-     * 徹底清空內部暫存清單，回到 `STATE_IDLE`。
-
----
-
-## 5. 實作注意事項與避坑指南 (Critical Notes)
-
-### 5.1 記憶體避坑
-* **禁止一次性讀入記憶體**：一律使用 `for line in f:` 串流逐行讀取，不可使用 `f.readlines()` 或 `f.read()`。
-* **嚴禁保留全域字典**：Reader 外部禁止宣告 `all_paths = []`，所有路徑必須經由 `yield` 即刻送入微批次寫入器（Sink），寫完即丟。
-
-### 5.2 正則表達式與格式避坑
-* **預編譯（Pre-compile）所有 Regex**：在模組頂層執行 `re.compile()`，嚴禁在每行迴圈中重新編譯正則。
-* **換行折行問題（Line Wrapping）**：
-  * 當 Pin 階層路徑極長時，PrimeTime 可能會將名稱與 delay 數字折成兩行：
-    ```
-    u_very_long_hierarchy/u_sub_block/
-    inst_name/pin_name (BUF_X1)    0.05    0.50 r
-    ```
-  * 解析器需具備「懸置行合併」邏輯：若某行只有 Pin 名稱而無延遲數字，應暫存字串並與下一行合併解析。
-* **跳過裝飾分隔線**：快速跳過包含 `--------------------`、`Point Incr Path`、`max_delay/setup` 等純標頭文字行，提升解析速度。
-
-### 5.3 DuckDB / Parquet 寫入避坑
-* **批次大小（Batch Size）控制**：每累積 **50,000 條路徑** 執行一次 PyArrow Table 轉換並寫入 Parquet（Row Group）。批次太小會導致 Parquet Metadata 碎片化；批次太大會消耗過多 RAM。
-* **資料型別明確化（Type Casting）**：
-  * Delay、Slack 等數值使用 `FLOAT` (32-bit float) 即可，不需要用到 `DOUBLE` (64-bit)，可直接縮減 50% 磁碟與記憶體開銷。
-  * `point_idx` 使用 `INT16`。
-* **DuckDB 掛載方式**：
-  * 落盤成 `.parquet` 後，在 Python 內呼叫 DuckDB 建立查詢連線：
-    ```python
-    import duckdb
-    con = duckdb.connect("timing_database.duckdb")
-    con.execute("CREATE OR REPLACE TABLE raw_paths AS SELECT * FROM 'raw_paths.parquet'")
-    con.execute("CREATE OR REPLACE TABLE raw_points AS SELECT * FROM 'raw_points.parquet'")
-    ```
-  * 或直接以 View 方式零拷貝載入（速度最快）：
-    ```python
-    con.execute("CREATE OR REPLACE VIEW raw_paths AS SELECT * FROM 'raw_paths.parquet'")
-    ```
-
----
-
-## 6. 檔案模組切分與執行檢查清單 (Task Checklist)
-
-開發時僅需實作以下三個核心檔案：
-
-- [ ] **`regex_patterns.py` (正則定義層)**
-  - [ ] 預編譯 Startpoint, Endpoint, Slack 格式。
-  - [ ] 預編譯 Table Row 格式（包含 cell_type、incr、path delay、r/f edge）。
-  - [ ] 預編譯 Clock 屬性（propagated vs ideal, uncertainty, CRPR）。
-- [ ] **`reader.py` (狀態機解析層)**
-  - [ ] 實作串流 Generator 函式 `stream_timing_report(report_path)`。
-  - [ ] 實作 Pre-CTS 與 Post-CTS 分段標籤自動切換（`path_segment`）。
-  - [ ] 處理長 Pin 名稱折行與空白分隔邏輯。
-- [ ] **`sink.py` (微批次落盤與 DuckDB 載入層)**
-  - [ ] 實作 `ParquetBatchWriter` 類別，維持記憶體在 500MB 內。
-  - [ ] 定義 PyArrow Schema（`raw_paths` 與 `raw_points`）。
-  - [ ] 撰寫載入至 `timing_database.duckdb` 的最後腳本。
+        ELSE 'VALID_PHYSICAL_PATH'
+    END AS legality_check_status
+FROM raw_paths;
+總結這樣做就對了！分清舞台：Pre-CTS 不看 Latency 差值，改看 Data Path 淨延遲。分清角色：In2Reg 檢查 input_delay，Reg2Reg 檢查 arrival vs latency。
